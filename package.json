@@ -1,12 +1,242 @@
-{
-  "name": "chunkymap-web",
-  "version": "1.0.0",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "express": "^4.19.2",
-    "ws": "^8.17.0"
-  }
+const express = require('express');
+const http = require('http');
+const WebSocket = require('ws');
+
+const app = express();
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server, path: '/ws' });
+
+const SECRET_KEY = process.env.SECRET_KEY || "my-secret-map-password-123";
+
+app.use(express.json({ limit: '100mb' }));
+
+let state = {
+    maps: {
+        overworld: { centerX: 0, centerZ: 0, radius: 5000, image: null },
+        nether: { centerX: 0, centerZ: 0, radius: 5000, image: null },
+        the_end: { centerX: 0, centerZ: 0, radius: 5000, image: null }
+    },
+    borders: {},
+    players: [],
+    waypoints: []
+};
+
+function authenticate(req, res, next) {
+    if (req.headers.authorization !== `Bearer ${SECRET_KEY}`) return res.status(403).json({ error: "Unauthorized" });
+    next();
 }
+
+app.post('/api/map-upload', authenticate, (req, res) => {
+    const { dimension, centerX, centerZ, radius, image } = req.body;
+    if (state.maps[dimension]) {
+        state.maps[dimension] = { centerX, centerZ, radius, image };
+        broadcast({ type: 'MAP_UPDATE', dimension, centerX, centerZ, radius, image });
+    }
+    res.sendStatus(200);
+});
+
+app.post('/api/telemetry', authenticate, (req, res) => {
+    if (req.body.borders) state.borders = req.body.borders;
+    if (req.body.players) state.players = req.body.players;
+    broadcast({ type: 'TELEMETRY', borders: state.borders, players: state.players });
+    res.sendStatus(200);
+});
+
+function broadcast(data) {
+    const msg = JSON.stringify(data);
+    wss.clients.forEach(client => { if (client.readyState === WebSocket.OPEN) client.send(msg); });
+}
+
+wss.on('connection', (ws) => {
+    ws.send(JSON.stringify({ type: 'INIT', state }));
+    ws.on('message', (msg) => {
+        try {
+            const data = JSON.parse(msg);
+            if (data.type === 'ADD_WAYPOINT') {
+                state.waypoints.push(data.waypoint);
+                broadcast({ type: 'WAYPOINTS_UPDATE', waypoints: state.waypoints });
+            }
+        } catch(e){}
+    });
+});
+
+app.get('/', (req, res) => {
+    res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>ChunkyX Pro Progression Map</title>
+    <style>
+        body { margin: 0; background: #121212; color: #fff; font-family: monospace; display: flex; align-items: center; justify-content: center; height: 100vh; overflow: hidden; }
+        #hud { position: fixed; top: 16px; left: 16px; background: rgba(0,0,0,0.9); padding: 14px; border: 2px solid #c6b08b; border-radius: 6px; z-index: 10; min-width: 250px; }
+        .dim-btns { display: flex; gap: 6px; margin: 10px 0; }
+        .dim-btn { flex: 1; padding: 6px; background: #2b2b2b; color: #ddd; border: 1px solid #555; cursor: pointer; font-family: monospace; font-weight: bold; }
+        .dim-btn.active { background: #c6b08b; color: #111; }
+        #map-frame { position: relative; padding: 18px; background: #d6c198; border: 6px solid #4a3c28; box-shadow: 0 12px 30px rgba(0,0,0,0.8); }
+        canvas { image-rendering: pixelated; display: block; background: #0b0716; cursor: grab; }
+        canvas:active { cursor: grabbing; }
+    </style>
+</head>
+<body>
+    <div id="hud">
+        <strong>ChunkyX Pro Map</strong>
+        <div class="dim-btns">
+            <button class="dim-btn active" onclick="switchDim('overworld', this)">Overworld</button>
+            <button class="dim-btn" onclick="switchDim('nether', this)">Nether</button>
+            <button class="dim-btn" onclick="switchDim('the_end', this)">The End</button>
+        </div>
+        <div id="coords">X: 0, Z: 0</div>
+        <div id="player-count">Online: 0</div>
+        <div style="font-size: 11px; color: #aaa; margin-top:8px;">💡 Right-click map to add waypoint</div>
+    </div>
+    <div id="map-frame">
+        <canvas id="mapCanvas" width="800" height="800"></canvas>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('mapCanvas');
+        const ctx = canvas.getContext('2d');
+        ctx.imageSmoothingEnabled = false;
+
+        let currentDim = 'overworld';
+        const images = { overworld: new Image(), nether: new Image(), the_end: new Image() };
+        let state = { maps: {}, borders: {}, players: [], waypoints: [] };
+        let zoom = 1, panX = 0, panY = 0, isDragging = false, startX = 0, startY = 0;
+
+        Object.values(images).forEach(img => img.onload = () => draw());
+
+        function switchDim(dim, btn) {
+            currentDim = dim;
+            document.querySelectorAll('.dim-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            zoom = 1; panX = 0; panY = 0;
+            draw();
+        }
+
+        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const ws = new WebSocket(protocol + '//' + location.host + '/ws');
+
+        ws.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            if (data.type === 'INIT') {
+                state = data.state;
+                for (const dim of ['overworld', 'nether', 'the_end']) {
+                    if (state.maps[dim] && state.maps[dim].image) images[dim].src = 'data:image/png;base64,' + state.maps[dim].image;
+                }
+            } else if (data.type === 'MAP_UPDATE') {
+                state.maps[data.dimension] = { centerX: data.centerX, centerZ: data.centerZ, radius: data.radius };
+                images[data.dimension].src = 'data:image/png;base64,' + data.image;
+            } else if (data.type === 'TELEMETRY') {
+                state.borders = data.borders;
+                state.players = data.players;
+            } else if (data.type === 'WAYPOINTS_UPDATE') {
+                state.waypoints = data.waypoints;
+            }
+            draw();
+        };
+
+        function worldToCanvas(wx, wz) {
+            const m = state.maps[currentDim] || { centerX: 0, centerZ: 0, radius: 5000 };
+            const normX = (wx - (m.centerX - m.radius)) / (m.radius * 2);
+            const normZ = (wz - (m.centerZ - m.radius)) / (m.radius * 2);
+            return { x: normX * canvas.width, y: normZ * canvas.height };
+        }
+
+        function draw() {
+            ctx.save();
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.translate(panX, panY);
+            ctx.scale(zoom, zoom);
+
+            const img = images[currentDim];
+            if (img && img.src) ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+            ctx.fillStyle = 'rgba(10, 10, 15, 0.85)';
+            ctx.fillRect(-5000, -5000, canvas.width * 10, canvas.height * 10);
+
+            state.players.filter(p => p.dimension === currentDim).forEach(p => {
+                const pos = worldToCanvas(p.x, p.z);
+                const grad = ctx.createRadialGradient(pos.x, pos.y, 20, pos.x, pos.y, 120);
+                grad.addColorStop(0, 'rgba(0,0,0,1)');
+                grad.addColorStop(1, 'rgba(0,0,0,0)');
+                ctx.globalCompositeOperation = 'destination-out';
+                ctx.fillStyle = grad;
+                ctx.beginPath();
+                ctx.arc(pos.x, pos.y, 120, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.globalCompositeOperation = 'source-over';
+            });
+
+            const border = state.borders[currentDim];
+            if (border) {
+                const half = border.size / 2;
+                const tl = worldToCanvas(border.centerX - half, border.centerZ - half);
+                const br = worldToCanvas(border.centerX + half, border.centerZ + half);
+                ctx.strokeStyle = '#ff3333';
+                ctx.lineWidth = 2 / zoom;
+                ctx.strokeRect(tl.x, tl.y, br.x - tl.x, br.y - tl.y);
+            }
+
+            state.waypoints.filter(w => w.dimension === currentDim).forEach(w => {
+                const pos = worldToCanvas(w.x, w.z);
+                ctx.fillStyle = '#ffcc00';
+                ctx.beginPath();
+                ctx.arc(pos.x, pos.y, 4 / zoom, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.font = (10 / zoom) + 'px monospace';
+                ctx.fillText(w.name, pos.x + (6 / zoom), pos.y + (3 / zoom));
+            });
+
+            const dimPlayers = state.players.filter(p => p.dimension === currentDim);
+            document.getElementById('player-count').innerText = 'Online in dim: ' + dimPlayers.length;
+            dimPlayers.forEach(p => {
+                const pos = worldToCanvas(p.x, p.z);
+                ctx.fillStyle = '#ffffff';
+                ctx.strokeStyle = '#000';
+                ctx.lineWidth = 1.5 / zoom;
+                ctx.beginPath();
+                ctx.arc(pos.x, pos.y, 5 / zoom, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.stroke();
+                ctx.font = (12 / zoom) + 'px monospace';
+                ctx.fillStyle = '#ffff55';
+                ctx.fillText(p.name, pos.x + (8 / zoom), pos.y + (4 / zoom));
+            });
+
+            ctx.restore();
+        }
+
+        canvas.addEventListener('wheel', e => {
+            e.preventDefault();
+            zoom = Math.max(1, Math.min(12, zoom * (e.deltaY < 0 ? 1.2 : 0.85)));
+            draw();
+        });
+        canvas.addEventListener('mousedown', e => { if(e.button===0){ isDragging = true; startX = e.clientX - panX; startY = e.clientY - panY; } });
+        window.addEventListener('mouseup', () => isDragging = false);
+        window.addEventListener('mousemove', e => {
+            if (isDragging) { panX = e.clientX - startX; panY = e.clientY - startY; draw(); }
+            const rect = canvas.getBoundingClientRect();
+            const m = state.maps[currentDim] || { centerX: 0, centerZ: 0, radius: 5000 };
+            const cx = ((e.clientX - rect.left - panX) / zoom) / canvas.width;
+            const cz = ((e.clientY - rect.top - panY) / zoom) / canvas.height;
+            document.getElementById('coords').innerText = 'X: ' + Math.round((m.centerX - m.radius) + cx * (m.radius * 2)) + ', Z: ' + Math.round((m.centerZ - m.radius) + cz * (m.radius * 2));
+        });
+        canvas.addEventListener('contextmenu', e => {
+            e.preventDefault();
+            const name = prompt("Enter waypoint name:");
+            if(!name) return;
+            const rect = canvas.getBoundingClientRect();
+            const m = state.maps[currentDim] || { centerX: 0, centerZ: 0, radius: 5000 };
+            const cx = ((e.clientX - rect.left - panX) / zoom) / canvas.width;
+            const cz = ((e.clientY - rect.top - panY) / zoom) / canvas.height;
+            const wx = Math.round((m.centerX - m.radius) + cx * (m.radius * 2));
+            const wz = Math.round((m.centerZ - m.radius) + cz * (m.radius * 2));
+            ws.send(JSON.stringify({ type: 'ADD_WAYPOINT', waypoint: { name, dimension: currentDim, x: wx, z: wz } }));
+        });
+    </script>
+</body>
+</html>`);
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log('ChunkyMap Pro Web Server running on port ' + PORT));
